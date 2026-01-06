@@ -41,6 +41,10 @@ max_seq_len = 2048 # max context length
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
 target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
+# Streaming mode
+streaming_mode = False # enable progressive shard downloading (default: False)
+streaming_buffer_size = 5 # number of shards to maintain ahead when streaming (default: 5)
+streaming_total_shards = -1 # total number of shards to download (-1 = auto-calculate from num_iterations)
 # Optimization
 device_batch_size = 32 # per-device batch size (set to not OOM)
 total_batch_size = 524288 # total desired batch size, in #tokens
@@ -167,9 +171,46 @@ if resuming:
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
+
+# Set up streaming downloader if enabled
+streaming_downloader = None
+if streaming_mode:
+    from nanochat.streaming_downloader import StreamingDownloader
+
+    # Calculate number of shards needed if not explicitly set
+    if streaming_total_shards == -1:
+        # Estimate based on training data requirements
+        # Each shard contains approximately 250MB of parquet data
+        # Estimate ~2.5M tokens per shard (approximate)
+        tokens_per_shard_estimate = 2_500_000
+        total_tokens_needed = total_batch_size * num_iterations
+        num_shards_needed = max(1, int(total_tokens_needed / tokens_per_shard_estimate) + 1)
+        print0(f"Streaming mode: calculated {num_shards_needed} shards needed for {total_tokens_needed:,} tokens")
+    else:
+        num_shards_needed = streaming_total_shards
+        print0(f"Streaming mode: using {num_shards_needed} shards (user-specified)")
+
+    # Create and start the streaming downloader
+    data_dir = os.path.join(base_dir, "base_data")
+    streaming_downloader = StreamingDownloader(
+        total_shards=num_shards_needed,
+        buffer_size=streaming_buffer_size,
+        data_dir=data_dir,
+        num_workers=4
+    )
+    streaming_downloader.start()
+    print0(f"Streaming downloader started with buffer_size={streaming_buffer_size}")
+
 tokens_dir = os.path.join(base_dir, "tokenized_data")
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state(device_batch_size, max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+train_loader = tokenizing_distributed_data_loader_with_state(
+    device_batch_size,
+    max_seq_len,
+    split="train",
+    device=device,
+    resume_state_dict=dataloader_resume_state_dict,
+    streaming_downloader=streaming_downloader
+)
 build_val_loader = lambda: tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
@@ -345,6 +386,11 @@ while True:
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+
+    # Log streaming status periodically
+    if streaming_downloader is not None and step % 100 == 0:
+        status = streaming_downloader.get_status()
+        print0(f"[Streaming] {status['downloaded']}/{status['total_shards']} shards downloaded, buffer: {status['buffer_available']}/{status['buffer_size']}, current: shard_{status['current_shard']:05d}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -395,5 +441,8 @@ get_report().log(section="Base model training", data=[
 ])
 
 # cleanup
+if streaming_downloader is not None:
+    print0("Stopping streaming downloader...")
+    streaming_downloader.stop()
 wandb_run.finish() # wandb run finish
 compute_cleanup()

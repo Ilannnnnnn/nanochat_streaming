@@ -1,4 +1,6 @@
 from collections import deque
+import logging
+import os
 
 import torch
 import pyarrow.parquet as pq
@@ -7,7 +9,28 @@ from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 from nanochat.tokenizer import get_tokenizer
 
-def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads=4, tokenizer_batch_size=128, device="cuda", resume_state_dict=None):
+# Set up logging
+logger = logging.getLogger('Dataloader')
+
+
+def extract_shard_id(filepath: str) -> int:
+    """
+    Extract shard ID from filepath.
+
+    Args:
+        filepath: Path like "/path/to/shard_00042.parquet"
+
+    Returns:
+        Shard ID (e.g., 42)
+    """
+    filename = os.path.basename(filepath)
+    # Extract the 5-digit number from "shard_00042.parquet"
+    if filename.startswith("shard_") and filename.endswith(".parquet"):
+        return int(filename[6:11])
+    raise ValueError(f"Invalid shard filename: {filename}")
+
+
+def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads=4, tokenizer_batch_size=128, device="cuda", resume_state_dict=None, streaming_downloader=None):
     """
     Stream pretraining text from parquet files, tokenize, yield training batches.
 
@@ -19,6 +42,9 @@ def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads
     The state_dict that is returned can be later passed into this function via `resume_state_dict` to approximately resume.
 
     Perfect state resumption is possible but would be a lot more bloated, probably not worth it atm.
+
+    Args:
+        streaming_downloader: Optional StreamingDownloader instance for progressive shard downloading
     """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
@@ -35,6 +61,17 @@ def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads
             pq_idx = resume_pq_idx if first_pass else 0
             while pq_idx < len(parquet_paths): # iterate over all parquet files
                 filepath = parquet_paths[pq_idx]
+
+                # If streaming downloader is enabled, wait for the shard to be available
+                if streaming_downloader is not None:
+                    try:
+                        shard_id = extract_shard_id(filepath)
+                        logger.info(f"Reading {os.path.basename(filepath)}")
+                        if not streaming_downloader.wait_for_shard(shard_id, timeout=300):
+                            raise RuntimeError(f"Timeout waiting for shard {shard_id}")
+                    except Exception as e:
+                        raise RuntimeError(f"Error waiting for shard {filepath}: {e}")
+
                 pf = pq.ParquetFile(filepath)
                 # Start from resume point if resuming on same file, otherwise from DDP rank
                 # I know this state resumption is a little bit tricky and a little bit hacky... sigh.
